@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Haven",
+  "version": "1.0",
+  "description": "Safer browsing, clearer signals",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "tabs"],
+  "host_permissions": ["<all_urls>", "http://localhost:3000/*"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"]
+    }
+  ]
+}
