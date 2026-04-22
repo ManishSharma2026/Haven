@@ -1,148 +1,208 @@
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 
 const app = express();
-const PORT = 3000;
 
-// Move this into .env later
-const NEWS_API_KEY = "2bb1f632b24c4b61ad36c239b83e413b";
+const PORT = Number(process.env.PORT || 3000);
+const NEWS_API_KEY = process.env.NEWS_API_KEY || "";
+const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434/api/generate";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3";
+const DEBUG_MODE = process.env.DEBUG_MODE === "true";
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 300000);
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 20000);
+const MAX_QUERY_COUNT = Number(process.env.MAX_QUERY_COUNT || 6);
+const NEWS_LOOKBACK_DAYS = Number(process.env.NEWS_LOOKBACK_DAYS || 30);
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: "1mb" }));
+
+app.use((req, res, next) => {
+  const start = Date.now();
+
+  if (DEBUG_MODE) {
+    console.log(`➡️ ${req.method} ${req.originalUrl}`);
+    if (req.method !== "GET") {
+      console.log("Request body:", req.body);
+    }
+  }
+
+  res.on("finish", () => {
+    if (DEBUG_MODE) {
+      const ms = Date.now() - start;
+      console.log(`✅ ${req.method} ${req.originalUrl} -> ${res.statusCode} (${ms}ms)`);
+    }
+  });
+
+  next();
+});
 
 app.get("/", (req, res) => {
   res.send("Haven backend is running.");
 });
 
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "haven-backend",
+    newsApiConfigured: Boolean(NEWS_API_KEY),
+    ollamaUrl: OLLAMA_URL,
+    ollamaModel: OLLAMA_MODEL,
+    cacheTtlMs: CACHE_TTL_MS,
+    requestTimeoutMs: REQUEST_TIMEOUT_MS,
+  });
+});
+
+app.get("/debug-ping", (req, res) => {
+  if (DEBUG_MODE) console.log("🔥 debug-ping route hit");
+  res.json({ ok: true, message: "Debug route works" });
+});
+
 /**
- * Stop words for building queries.
- * These are weak framing words and vague time/context words.
+ * In-memory caches
+ */
+const newsCache = new Map();
+const aiCache = new Map();
+
+function getCache(cache, key) {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function setCache(cache, key, value, ttlMs = CACHE_TTL_MS) {
+  cache.set(key, {
+    value,
+    expiresAt: Date.now() + ttlMs,
+  });
+}
+
+/**
+ * Word sets
  */
 const QUERY_STOP_WORDS = new Set([
-  "the",
-  "and",
-  "for",
-  "with",
-  "that",
-  "this",
-  "from",
-  "have",
-  "been",
-  "were",
-  "will",
-  "would",
-  "could",
-  "should",
-  "about",
-  "after",
-  "before",
-  "into",
-  "over",
-  "under",
-  "only",
-  "more",
-  "than",
-  "they",
-  "them",
-  "their",
-  "what",
-  "when",
-  "where",
-  "which",
-  "while",
+  "the", "and", "for", "with", "that", "this", "from", "have", "been", "were",
+  "will", "would", "could", "should", "about", "after", "before", "into", "over",
+  "under", "only", "more", "than", "they", "them", "their", "what", "when",
+  "where", "which", "while", "said", "says", "are", "was", "is", "being",
+  "latest", "live", "updates", "update", "breaking", "report", "reports",
+  "today", "tomorrow", "yesterday", "next", "day", "days", "week", "weeks",
+  "month", "months", "year", "years", "official", "officials", "one", "two",
+  "three", "four", "five", "of", "few", "since", "amid", "across", "within",
+  "during", "through", "via", "pass", "claim", "claimed", "claims", "according",
+  "reportedly", "statement", "statements", "liveblog", "live blog",
+]);
+
+const SCORE_STOP_WORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "from", "have", "been", "were",
+  "will", "would", "could", "should", "about", "after", "before", "into", "over",
+  "under", "only", "more", "than", "they", "them", "their", "what", "when",
+  "where", "which", "while", "said", "says", "are", "was", "is",
+]);
+
+const ATTRIBUTION_WORDS = new Set([
   "said",
   "says",
-  "are",
-  "was",
-  "is",
-  "being",
-  "latest",
-  "live",
-  "updates",
-  "update",
-  "breaking",
-  "report",
-  "reports",
-  "hint",
-  "hints",
+  "claim",
+  "claimed",
+  "claims",
+  "according",
+  "reportedly",
+  "told",
+  "announced",
+  "stated",
+]);
+
+const LOCATION_HINTS = new Set([
+  "strait",
+  "gulf",
+  "sea",
+  "ocean",
+  "port",
+  "city",
+  "state",
+  "province",
+  "country",
+  "region",
+  "border",
+  "airport",
+  "harbor",
+  "harbour",
+  "bay",
+  "channel",
+  "coast",
+  "capital",
+]);
+
+const OBJECT_HINTS = new Set([
+  "ship",
+  "ships",
+  "vessel",
+  "vessels",
+  "cargo",
+  "boat",
+  "boats",
+  "missile",
+  "missiles",
+  "drone",
+  "drones",
+  "base",
+  "bases",
+  "facility",
+  "facilities",
+  "plant",
+  "plants",
+  "tank",
+  "tanks",
+  "pipeline",
+  "pipelines",
+  "election",
+  "ballot",
+  "tariff",
+  "tariffs",
+  "sanction",
+  "sanctions",
+  "troops",
+  "hostages",
+  "deal",
+  "ceasefire",
+]);
+
+const TIME_HINTS = new Set([
   "today",
   "tomorrow",
   "yesterday",
-  "next",
-  "day",
-  "days",
-  "week",
-  "weeks",
-  "month",
-  "months",
-  "year",
-  "years",
-  "official",
-  "officials",
-  "one",
-  "two",
-  "three",
-  "four",
-  "five",
-  "of",
-  "few",
-  "since",
-  "amid",
-  "across",
-  "within",
-  "during",
-  "through",
-  "via",
-  "pass",
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+  "sunday",
+  "january",
+  "february",
+  "march",
+  "april",
+  "may",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
+  "morning",
+  "afternoon",
+  "evening",
+  "night",
 ]);
 
-/**
- * Lighter stop words for scoring.
- */
-const SCORE_STOP_WORDS = new Set([
-  "the",
-  "and",
-  "for",
-  "with",
-  "that",
-  "this",
-  "from",
-  "have",
-  "been",
-  "were",
-  "will",
-  "would",
-  "could",
-  "should",
-  "about",
-  "after",
-  "before",
-  "into",
-  "over",
-  "under",
-  "only",
-  "more",
-  "than",
-  "they",
-  "them",
-  "their",
-  "what",
-  "when",
-  "where",
-  "which",
-  "while",
-  "said",
-  "says",
-  "are",
-  "was",
-  "is",
-]);
-
-/**
- * Useful entity aliases.
- * Unknown important words can still become entities.
- */
 const ENTITY_ALIASES = {
   us: ["us", "u.s", "united states", "america", "american", "washington"],
   uk: ["uk", "u.k", "united kingdom", "britain", "british"],
@@ -153,150 +213,94 @@ const ENTITY_ALIASES = {
   iran: ["iran", "iranian", "tehran"],
   israel: ["israel", "israeli", "jerusalem"],
   lebanon: ["lebanon", "lebanese", "beirut"],
+  ukraine: ["ukraine", "ukrainian", "kyiv", "kiev"],
+  gaza: ["gaza", "gazan"],
+  hamas: ["hamas"],
+  houthis: ["houthis", "houthi"],
+  trump: ["trump", "donald trump"],
+  nato: ["nato"],
+  eucommission: ["european commission"],
+  whitehouse: ["white house"],
 };
 
-/**
- * Generic action/event groups.
- */
 const ACTION_GROUPS = {
-  talks: [
-    "talks",
-    "negotiations",
-    "meeting",
-    "meetings",
-    "diplomatic",
-    "diplomacy",
-    "discussion",
-  ],
+  talks: ["talks", "negotiations", "meeting", "meetings", "diplomatic", "discussion"],
   resume: ["resume", "restart", "renew", "continue", "reopen"],
-  approve: [
-    "approve",
-    "approved",
-    "approval",
-    "authorize",
-    "authorized",
-    "authorization",
-    "cleared",
-    "greenlit",
-  ],
-  acquire: [
-    "acquire",
-    "acquired",
-    "buy",
-    "bought",
-    "purchase",
-    "purchased",
-    "takeover",
-    "merger",
-  ],
-  launch: [
-    "launch",
-    "launched",
-    "release",
-    "released",
-    "unveiled",
-    "introduced",
-  ],
+  approve: ["approve", "approved", "approval", "authorize", "authorized"],
+  acquire: ["acquire", "acquired", "buy", "bought", "purchase", "purchased", "takeover", "merger"],
+  launch: ["launch", "launched", "unveiled", "introduced"],
   kill: ["kill", "killed", "dead", "death", "deaths", "fatality", "fatalities"],
   sue: ["sue", "sued", "lawsuit", "legal action"],
   win: ["win", "won", "victory", "beat", "defeated"],
   lose: ["lose", "lost", "defeat"],
   rise: ["rise", "rising", "increase", "increased", "surge", "jump", "up"],
-  fall: [
-    "fall",
-    "fell",
-    "drop",
-    "dropped",
-    "decline",
-    "declined",
-    "slump",
-    "down",
-  ],
-  drop: [
-    "drop",
-    "decline",
-    "declined",
-    "reduced",
-    "reduction",
-    "fall",
-    "fell",
-    "fewer",
-    "less",
-  ],
-  traffic: [
-    "traffic",
-    "flow",
-    "shipping",
-    "shipments",
-    "transit",
-    "passage",
-    "movement",
-  ],
-  fire: ["fire", "fired", "dismissed", "terminated"],
+  fall: ["fall", "fell", "drop", "dropped", "decline", "declined", "slump", "down"],
+  drop: ["drop", "decline", "declined", "reduced", "reduction", "fall", "fell", "fewer", "less"],
+  traffic: ["traffic", "flow", "shipping", "shipments", "transit", "passage", "movement"],
+  fire: ["fire", "fired", "shoot", "shot", "shooting"],
+  seize: ["seize", "seized", "capture", "captured", "boarded", "board", "took", "seizure"],
   arrest: ["arrest", "arrested", "detained", "custody"],
   ban: ["ban", "banned", "block", "blocked", "prohibit", "prohibited"],
   blockade: ["blockade", "blocked", "closure", "shut", "restriction"],
   warn: ["warn", "warning", "alert", "caution"],
   ceasefire: ["ceasefire", "truce", "pause"],
   election: ["election", "vote", "voting", "ballot", "polls"],
-  disaster: [
-    "earthquake",
-    "flood",
-    "wildfire",
-    "storm",
-    "hurricane",
-    "tornado",
-  ],
+  strike: ["strike", "strikes", "attacked", "attack", "bombed", "airstrike"],
+  sanction: ["sanction", "sanctions", "penalty", "penalties"],
+  release: ["release", "released", "free", "freed"],
+  deny: ["deny", "denied", "denies"],
+  end: ["end", "ends", "ended", "expire", "expires", "expired"],
+  extend: ["extend", "extends", "extended", "extension", "renew", "renewed"],
 };
 
+const CONTRADICTION_PAIRS = [
+  ["seize", "release"],
+  ["approve", "block"],
+  ["win", "lose"],
+  ["rise", "fall"],
+  ["kill", "wound"],
+  ["launch", "delay"],
+  ["fire", "deny"],
+  ["sanction", "lift"],
+  ["end", "extend"],
+  ["extend", "end"],
+];
+
 const TRUSTED_SOURCES = [
-  "reuters",
-  "associated press",
-  "ap news",
-  "bbc",
-  "cnn",
-  "new york times",
-  "the new york times",
-  "washington post",
-  "the washington post",
-  "npr",
-  "guardian",
-  "the guardian",
-  "al jazeera",
-  "bloomberg",
-  "financial times",
-  "wall street journal",
-  "wsj",
-  "abc news",
-  "cbs news",
-  "nbc news",
-  "pbs",
-  "economist",
-  "the economist",
-  "forbes",
-  "time",
-  "politico",
-  "axios",
+  "reuters", "associated press", "ap news", "bbc", "cnn",
+  "new york times", "the new york times", "washington post", "the washington post",
+  "npr", "guardian", "the guardian", "al jazeera", "bloomberg",
+  "financial times", "wall street journal", "wsj", "abc news",
+  "cbs news", "nbc news", "pbs", "economist", "the economist",
+  "forbes", "time", "politico", "axios",
 ];
 
 const WEAK_SOURCE_PATTERNS = [
-  "slashdot",
-  "freerepublic",
-  "juancole",
-  "commondreams",
-  "thechronicle.com.gh",
   "blogspot",
   "substack",
+  "freerepublic",
+  "commondreams",
+  "wnd.com",
+  "ibtimes.com.au",
+  "globalsecurity.org",
+  "activistpost.com",
 ];
 
-/**
- * Text helpers
- */
+const BLOCKED_DOMAINS = [
+  "wnd.com",
+  "ibtimes.com.au",
+  "globalsecurity.org",
+  "activistpost.com",
+];
+
 function normalizeText(value) {
   return String(value || "")
     .toLowerCase()
-    .replace(/-/g, " ")
-    .replace(/[^\w\s%$./]/g, " ")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[-–—]/g, " ")
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[^\w\s%$./']/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -308,13 +312,11 @@ function unique(arr) {
 function tokenize(text, stopWords = new Set()) {
   return normalizeText(text)
     .split(" ")
-    .filter((word) => word.length > 0 && !stopWords.has(word));
+    .filter((word) => word && !stopWords.has(word));
 }
 
 function extractNumbers(text) {
-  const matches = String(text || "").match(
-    /\b\d+(?:\.\d+)?%?\b|\$\d+(?:\.\d+)?\b/g,
-  );
+  const matches = String(text || "").match(/\b\d+(?:\.\d+)?%?\b|\$\d+(?:\.\d+)?\b/g);
   return matches ? unique(matches.map((m) => m.toLowerCase())) : [];
 }
 
@@ -327,104 +329,74 @@ function extractDomain(url) {
 }
 
 function looksLikeTimeWord(word) {
-  return [
-    "day",
-    "days",
-    "week",
-    "weeks",
-    "month",
-    "months",
-    "year",
-    "years",
-    "today",
-    "tomorrow",
-    "yesterday",
-    "next",
-    "one",
-    "two",
-    "three",
-    "four",
-    "five",
-  ].includes(word);
+  return (
+    [
+      "day", "days", "week", "weeks", "month", "months", "year", "years",
+      "today", "tomorrow", "yesterday", "next", "one", "two", "three", "four", "five",
+    ].includes(word) || TIME_HINTS.has(word)
+  );
 }
 
-function isLikelyEntity(word) {
-  if (!word || word.length < 4) return false;
-  if (QUERY_STOP_WORDS.has(word)) return false;
-  if (ACTION_GROUPS[word]) return false;
-
-  const genericWords = new Set([
-    "middle",
-    "east",
-    "conflict",
-    "ships",
-    "pass",
-    "since",
-    "few",
-    "many",
-    "more",
-    "less",
-    "amid",
-    "global",
-    "world",
-    "international",
-    "regional",
-    "news",
-    "live",
-    "update",
-    "updates",
-  ]);
-
-  if (genericWords.has(word)) return false;
-
-  return true;
+function cleanInputText(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1200);
 }
 
-function isGoodDescriptor(word) {
-  if (!word) return false;
-  if (word.length < 4) return false;
-  if (looksLikeTimeWord(word)) return false;
-  if (QUERY_STOP_WORDS.has(word)) return false;
-  if (ACTION_GROUPS[word]) return false;
-
-  const badDescriptors = new Set([
-    "middle",
-    "east",
-    "conflict",
-    "global",
-    "world",
-    "international",
-    "regional",
-  ]);
-
-  return !badDescriptors.has(word);
+function recentDateIso(daysBack = NEWS_LOOKBACK_DAYS) {
+  const d = new Date();
+  d.setDate(d.getDate() - daysBack);
+  return d.toISOString();
 }
 
-/**
- * Source helpers
- */
+function containsAnyPhrase(text, values) {
+  const normalized = normalizeText(text);
+  return values.some((value) => normalized.includes(normalizeText(value)));
+}
+
+function stripAttribution(text) {
+  let cleaned = String(text || "").trim();
+
+  const tailPatterns = [
+    /,\s*[^,]{1,60}\s+says$/i,
+    /,\s*[^,]{1,60}\s+said$/i,
+    /,\s*according to [^,]+$/i,
+    /\s+-\s*[^-]{1,60}\s+says$/i,
+    /\s+-\s*[^-]{1,60}\s+said$/i,
+  ];
+
+  const frontPatterns = [
+    /^[^,]{1,60}\s+says\s+/i,
+    /^[^,]{1,60}\s+said\s+/i,
+    /^according to [^,]{1,60},?\s+/i,
+  ];
+
+  for (const pattern of tailPatterns) {
+    cleaned = cleaned.replace(pattern, "").trim();
+  }
+
+  for (const pattern of frontPatterns) {
+    cleaned = cleaned.replace(pattern, "").trim();
+  }
+
+  return cleaned;
+}
+
 function inferCanonicalSource(article) {
   const rawSource = (article.source?.name || "").trim();
   const title = (article.title || "").toLowerCase();
   const domain = extractDomain(article.url || "");
 
-  if (title.includes("reuters")) return "Reuters";
-  if (title.includes("associated press") || title.includes("ap news")) {
+  if (title.includes("reuters") || domain.includes("reuters.com")) return "Reuters";
+  if (title.includes("associated press") || title.includes("ap news") || domain.includes("apnews.com")) {
     return "Associated Press";
   }
-  if (title.includes("bloomberg")) return "Bloomberg";
-  if (title.includes("bbc")) return "BBC";
-  if (title.includes("cnn")) return "CNN";
-  if (title.includes("new york times")) return "The New York Times";
-  if (title.includes("washington post")) return "The Washington Post";
-
-  if (domain.includes("reuters.com")) return "Reuters";
-  if (domain.includes("apnews.com")) return "Associated Press";
-  if (domain.includes("bloomberg.com")) return "Bloomberg";
-  if (domain.includes("bbc.com") || domain.includes("bbc.co.uk")) return "BBC";
-  if (domain.includes("cnn.com")) return "CNN";
-  if (domain.includes("nytimes.com")) return "The New York Times";
-  if (domain.includes("washingtonpost.com")) return "The Washington Post";
+  if (title.includes("bloomberg") || domain.includes("bloomberg.com")) return "Bloomberg";
+  if (title.includes("bbc") || domain.includes("bbc.com") || domain.includes("bbc.co.uk")) return "BBC";
+  if (title.includes("cnn") || domain.includes("cnn.com")) return "CNN";
+  if (title.includes("new york times") || domain.includes("nytimes.com")) return "The New York Times";
+  if (title.includes("washington post") || domain.includes("washingtonpost.com")) return "The Washington Post";
   if (domain.includes("npr.org")) return "NPR";
   if (domain.includes("theguardian.com")) return "The Guardian";
   if (domain.includes("aljazeera.com")) return "Al Jazeera";
@@ -432,8 +404,8 @@ function inferCanonicalSource(article) {
   if (domain.includes("wsj.com")) return "The Wall Street Journal";
   if (domain.includes("axios.com")) return "Axios";
   if (domain.includes("politico.com")) return "Politico";
-  if (domain.includes("time.com")) return "Time";
-  if (domain.includes("forbes.com")) return "Forbes";
+  if (domain.includes("foxnews.com")) return "Fox News";
+  if (domain.includes("businessinsider.com")) return "Business Insider";
 
   return rawSource || domain || "Unknown Source";
 }
@@ -443,48 +415,223 @@ function isTrustedSourceName(sourceName) {
   return TRUSTED_SOURCES.some((trusted) => s.includes(trusted));
 }
 
-/**
- * Claim modeling
- */
-function buildClaimModel(text) {
-  const cleanedText = normalizeText(text);
-  const rawTokens = tokenize(cleanedText, QUERY_STOP_WORDS);
-  const keywords = unique(rawTokens).slice(0, 14);
-  const numbers = extractNumbers(text);
+function isAllowedArticle(article) {
+  const sourceName = inferCanonicalSource(article).toLowerCase();
+  const domain = extractDomain(article.url || "");
+  const title = normalizeText(article.title || "");
 
-  const entities = [];
-  const actions = [];
-  const descriptors = [];
+  if (BLOCKED_DOMAINS.some((blocked) => domain.includes(blocked) || sourceName.includes(blocked))) {
+    return false;
+  }
 
-  for (const word of keywords) {
-    if (ENTITY_ALIASES[word]) {
-      entities.push(word);
-    } else if (ACTION_GROUPS[word]) {
-      actions.push(word);
-    } else if (looksLikeTimeWord(word)) {
-      continue;
-    } else if (isLikelyEntity(word)) {
-      entities.push(word);
-    } else if (isGoodDescriptor(word)) {
-      descriptors.push(word);
+  if (title.includes("live updates") || title.includes("live blog")) {
+    return false;
+  }
+
+  if (title.includes("opinion") || title.includes("editorial")) {
+    return false;
+  }
+
+  return true;
+}
+
+function articleText(article) {
+  return normalizeText(`${article.title || ""} ${article.description || ""}`);
+}
+
+function extractPhrases(text) {
+  const words = normalizeText(text).split(" ").filter(Boolean);
+  const phrases = [];
+
+  for (let i = 0; i < words.length; i++) {
+    const w1 = words[i];
+    const w2 = words[i + 1];
+    const w3 = words[i + 2];
+
+    if (w1) phrases.push(w1);
+    if (w1 && w2) phrases.push(`${w1} ${w2}`);
+    if (w1 && w2 && w3) phrases.push(`${w1} ${w2} ${w3}`);
+  }
+
+  return unique(phrases);
+}
+
+function classifySingleToken(word) {
+  if (!word || word.length < 2) return "ignore";
+  if (QUERY_STOP_WORDS.has(word)) return "ignore";
+  if (looksLikeTimeWord(word)) return "time";
+  if (ATTRIBUTION_WORDS.has(word)) return "attribution";
+  if (OBJECT_HINTS.has(word)) return "object";
+  if (LOCATION_HINTS.has(word)) return "location";
+  if (ENTITY_ALIASES[word]) return "entity";
+
+  for (const [groupName, aliases] of Object.entries(ACTION_GROUPS)) {
+    if (groupName === word || aliases.includes(word)) {
+      return "action";
     }
   }
 
-  const strongKeywords = keywords.filter(
-    (word) =>
-      word.length >= 5 &&
-      !looksLikeTimeWord(word) &&
-      !QUERY_STOP_WORDS.has(word),
-  );
+  return word.length >= 5 ? "candidate_entity" : "descriptor";
+}
+
+function classifyPhrase(phrase) {
+  const p = normalizeText(phrase);
+  const parts = p.split(" ").filter(Boolean);
+
+  if (!p) return { type: "ignore", value: phrase };
+
+  for (const [groupName, aliases] of Object.entries(ACTION_GROUPS)) {
+    const normalizedAliases = aliases.map((a) => normalizeText(a));
+    const exactPhraseMatch = normalizedAliases.includes(p) || groupName === p;
+    const exactTokenMatch = parts.some((part) => normalizedAliases.includes(part));
+
+    if (exactPhraseMatch || exactTokenMatch) {
+      return { type: "action", value: groupName };
+    }
+  }
+
+  if (parts.some((part) => ATTRIBUTION_WORDS.has(part))) {
+    return { type: "attribution", value: phrase };
+  }
+
+  if (parts.some((part) => TIME_HINTS.has(part) || looksLikeTimeWord(part))) {
+    return { type: "time", value: phrase };
+  }
+
+  if (parts.some((part) => LOCATION_HINTS.has(part))) {
+    return { type: "location", value: phrase };
+  }
+
+  if (parts.some((part) => OBJECT_HINTS.has(part))) {
+    return { type: "object", value: phrase };
+  }
+
+  const aliasMatched = Object.keys(ENTITY_ALIASES).some((key) => p.includes(key));
+  if (aliasMatched) {
+    return { type: "entity", value: phrase };
+  }
+
+  if (parts.length >= 2) {
+    const badStarts = new Set(["and", "or", "but", "a", "an", "the", "on", "in", "of", "to", "after"]);
+    const badParts = new Set([
+      "evening",
+      "morning",
+      "afternoon",
+      "night",
+      "highly",
+      "unlikely",
+      "further",
+      "extension",
+      "shaky",
+      "footing",
+    ]);
+
+    const hasVerb = parts.some((part) => classifySingleToken(part) === "action");
+    const startsBad = badStarts.has(parts[0]);
+    const allBadish = parts.every((part) => badParts.has(part) || QUERY_STOP_WORDS.has(part));
+
+    if (hasVerb || startsBad || allBadish) {
+      return { type: "descriptor", value: phrase };
+    }
+
+    return { type: "candidate_entity", value: phrase };
+  }
+
+  return { type: classifySingleToken(p), value: phrase };
+}
+
+function pushRole(event, role, value) {
+  if (!value) return;
+  const normalized = normalizeText(value);
+  if (!normalized) return;
+  event[role].push(value);
+}
+
+function buildEventModel(text) {
+  const cleanedText = normalizeText(text);
+  const rawTokens = tokenize(cleanedText, QUERY_STOP_WORDS).slice(0, 20);
+  const phrases = extractPhrases(text);
+  const numbers = extractNumbers(text);
+
+  const event = {
+    actor: [],
+    action: [],
+    object: [],
+    location: [],
+    time: [],
+    attribution: [],
+    qualifiers: [],
+  };
+
+  const keywords = [];
+  const strongKeywords = [];
+
+  for (const token of rawTokens) {
+    keywords.push(token);
+    if (token.length >= 5 && !looksLikeTimeWord(token) && !QUERY_STOP_WORDS.has(token)) {
+      strongKeywords.push(token);
+    }
+
+    const tokenType = classifySingleToken(token);
+    if (tokenType === "action") {
+      for (const [groupName, aliases] of Object.entries(ACTION_GROUPS)) {
+        if (groupName === token || aliases.includes(token)) {
+          pushRole(event, "action", groupName);
+          break;
+        }
+      }
+    } else if (tokenType === "object" || tokenType === "descriptor") {
+      pushRole(event, "object", token);
+    } else if (tokenType === "location") {
+      pushRole(event, "location", token);
+    } else if (tokenType === "time") {
+      pushRole(event, "time", token);
+    } else if (tokenType === "attribution") {
+      pushRole(event, "attribution", token);
+    } else if (tokenType === "entity") {
+      pushRole(event, "actor", token);
+    }
+  }
+
+  for (const phrase of phrases) {
+    const result = classifyPhrase(phrase);
+
+    if (result.type === "action") {
+      pushRole(event, "action", result.value);
+    } else if (result.type === "object") {
+      pushRole(event, "object", result.value);
+    } else if (result.type === "location") {
+      pushRole(event, "location", result.value);
+    } else if (result.type === "time") {
+      pushRole(event, "time", result.value);
+    } else if (result.type === "attribution") {
+      pushRole(event, "attribution", result.value);
+    } else if (result.type === "entity") {
+      pushRole(event, "actor", result.value);
+    } else if (result.type === "candidate_entity") {
+      const lower = normalizeText(result.value);
+      if ([...OBJECT_HINTS].some((hint) => lower.includes(hint))) {
+        pushRole(event, "object", result.value);
+      } else {
+        pushRole(event, "actor", result.value);
+      }
+    }
+  }
 
   return {
     cleanedText,
-    keywords,
-    entities: unique(entities),
-    actions: unique(actions),
-    descriptors: unique(descriptors),
+    keywords: unique(keywords).slice(0, 16),
+    strongKeywords: unique(strongKeywords).slice(0, 8),
     numbers,
-    strongKeywords,
+    event: {
+      actor: unique(event.actor).slice(0, 5),
+      action: unique(event.action).slice(0, 4),
+      object: unique(event.object).slice(0, 5),
+      location: unique(event.location).slice(0, 3),
+      time: unique(event.time).slice(0, 3),
+      attribution: unique(event.attribution).slice(0, 3),
+      qualifiers: unique(event.qualifiers).slice(0, 3),
+    },
   };
 }
 
@@ -494,9 +641,13 @@ function expandEntities(entities) {
   for (const entity of entities) {
     expanded.add(entity);
 
-    if (ENTITY_ALIASES[entity]) {
-      for (const alias of ENTITY_ALIASES[entity]) {
-        expanded.add(alias);
+    const pieces = normalizeText(entity).split(" ");
+    for (const piece of pieces) {
+      expanded.add(piece);
+      if (ENTITY_ALIASES[piece]) {
+        for (const alias of ENTITY_ALIASES[piece]) {
+          expanded.add(alias);
+        }
       }
     }
   }
@@ -509,7 +660,6 @@ function expandActions(actions) {
 
   for (const action of actions) {
     expanded.add(action);
-
     if (ACTION_GROUPS[action]) {
       for (const alias of ACTION_GROUPS[action]) {
         expanded.add(alias);
@@ -520,8 +670,8 @@ function expandActions(actions) {
   return [...expanded];
 }
 
-function detectPrimaryAnchor(claim) {
-  const genericEntities = new Set([
+function detectPrimaryAnchor(eventModel) {
+  const genericActors = new Set([
     "us",
     "uk",
     "eu",
@@ -531,124 +681,227 @@ function detectPrimaryAnchor(claim) {
     "iran",
     "israel",
     "lebanon",
+    "trump",
   ]);
 
-  for (const entity of claim.entities) {
-    if (!genericEntities.has(entity)) {
-      return entity;
+  for (const actor of eventModel.event.actor) {
+    const first = normalizeText(actor).split(" ")[0];
+    if (!genericActors.has(first)) return actor;
+  }
+
+  return eventModel.event.actor[0] || eventModel.event.object[0] || null;
+}
+
+function detectEffectTerms(eventModel) {
+  const text = normalizeText(
+    [
+      eventModel.cleanedText,
+      ...eventModel.event.object,
+      ...eventModel.event.location,
+    ].join(" "),
+  );
+
+  const effects = [];
+
+  if (/(ship|shipping|traffic|transit|flow|passage|vessel|cargo)/.test(text)) {
+    effects.push("traffic");
+  }
+
+  if (/(few|less|fewer|drop|decline|reduced|fall)/.test(text)) {
+    effects.push("drop");
+  }
+
+  return unique(effects);
+}
+
+async function askLocalAI(prompt, options = {}) {
+  try {
+    const response = await axios.post(
+      OLLAMA_URL,
+      {
+        model: OLLAMA_MODEL,
+        prompt,
+        stream: false,
+        options: {
+          temperature: options.temperature ?? 0.2,
+        },
+      },
+      { timeout: options.timeout ?? REQUEST_TIMEOUT_MS },
+    );
+
+    return response.data?.response || null;
+  } catch (error) {
+    if (DEBUG_MODE) {
+      console.error("Local AI error:", error.message);
+    }
+    return null;
+  }
+}
+
+function safeJsonParse(value) {
+  if (!value || typeof value !== "string") return null;
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    const match = value.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+    if (!match) return null;
+
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function parseClaimWithAI(text) {
+  const key = `parse:${normalizeText(text)}`;
+  const cached = getCache(aiCache, key);
+  if (cached) return cached;
+
+  const prompt = `
+You are helping a fact-checking assistant.
+
+Analyze the headline or claim below and return JSON only.
+
+Required JSON shape:
+{
+  "mainClaim": "string",
+  "eventActor": ["string"],
+  "eventAction": ["string"],
+  "eventObject": ["string"],
+  "eventLocation": ["string"],
+  "eventTime": ["string"],
+  "attributionSource": ["string"],
+  "qualifiers": ["string"],
+  "alternateFramings": ["string"],
+  "searchQueries": ["string"]
+}
+
+Rules:
+- Return valid JSON only.
+- If the text includes attribution like "X says" or "according to X", do NOT make X the event actor unless X actually performed the event.
+- Focus on the real-world event, not who is reporting it.
+- Use short arrays.
+- Keep alternateFramings to 4 items max.
+- Keep searchQueries to 4 items max.
+- Search queries should target the exact event and avoid broad topic summaries.
+- Do not include markdown.
+
+Claim:
+"${cleanInputText(text)}"
+`;
+
+  const response = await askLocalAI(prompt, {
+    temperature: 0.1,
+    timeout: REQUEST_TIMEOUT_MS,
+  });
+
+  const parsed = safeJsonParse(response);
+  if (!parsed) return null;
+
+  const result = {
+    mainClaim: parsed.mainClaim || text,
+    eventActor: Array.isArray(parsed.eventActor) ? parsed.eventActor.slice(0, 4) : [],
+    eventAction: Array.isArray(parsed.eventAction) ? parsed.eventAction.slice(0, 4) : [],
+    eventObject: Array.isArray(parsed.eventObject) ? parsed.eventObject.slice(0, 4) : [],
+    eventLocation: Array.isArray(parsed.eventLocation) ? parsed.eventLocation.slice(0, 3) : [],
+    eventTime: Array.isArray(parsed.eventTime) ? parsed.eventTime.slice(0, 3) : [],
+    attributionSource: Array.isArray(parsed.attributionSource) ? parsed.attributionSource.slice(0, 3) : [],
+    qualifiers: Array.isArray(parsed.qualifiers) ? parsed.qualifiers.slice(0, 4) : [],
+    alternateFramings: Array.isArray(parsed.alternateFramings)
+      ? parsed.alternateFramings.slice(0, 4)
+      : [],
+    searchQueries: Array.isArray(parsed.searchQueries)
+      ? parsed.searchQueries.slice(0, 4)
+      : [],
+  };
+
+  setCache(aiCache, key, result);
+  return result;
+}
+
+function buildQueriesFromEvent(eventModel, aiClaim = null) {
+  const querySet = new Set();
+
+  const actor = eventModel.event.actor[0] || "";
+  const action = eventModel.event.action[0] || "";
+  const object = eventModel.event.object[0] || "";
+  const location = eventModel.event.location[0] || "";
+
+  if (aiClaim?.searchQueries?.length) {
+    for (const query of aiClaim.searchQueries) {
+      if (query && query.trim().length >= 6) {
+        querySet.add(query.trim());
+      }
     }
   }
 
-  return claim.entities[0] || null;
-}
-
-function detectEffectTerms(claim) {
-  const effectTerms = [];
-  const text = `${claim.cleanedText} ${claim.descriptors.join(" ")}`;
-
-  if (
-    text.includes("ship") ||
-    text.includes("shipping") ||
-    text.includes("traffic") ||
-    text.includes("transit") ||
-    text.includes("flow")
-  ) {
-    effectTerms.push("traffic");
+  if (aiClaim?.mainClaim) {
+    querySet.add(aiClaim.mainClaim.trim());
   }
 
-  if (
-    text.includes("few") ||
-    text.includes("less") ||
-    text.includes("fewer") ||
-    text.includes("drop") ||
-    text.includes("decline") ||
-    text.includes("reduced") ||
-    text.includes("fall")
-  ) {
-    effectTerms.push("drop");
+  if (aiClaim?.eventActor?.length && aiClaim?.eventAction?.length && aiClaim?.eventObject?.length) {
+    querySet.add(
+      `${aiClaim.eventActor[0]} ${aiClaim.eventAction[0]} ${aiClaim.eventObject[0]}`.trim(),
+    );
+    querySet.add(
+      `${aiClaim.eventObject[0]} ${aiClaim.eventAction[0]} ${aiClaim.eventActor[0]}`.trim(),
+    );
   }
 
-  return unique(effectTerms);
-}
+  if (actor && action && object) {
+    querySet.add(`${actor} ${action} ${object}`.trim());
+    querySet.add(`${object} ${action} ${actor}`.trim());
+  }
 
-/**
- * Query building
- */
-function buildQueries(claim) {
-  const phraseParts = [
-    ...claim.entities.slice(0, 2),
-    ...claim.actions.slice(0, 2),
-    ...claim.descriptors.slice(0, 2),
-  ].filter(Boolean);
+  if (actor && object) {
+    querySet.add(`${actor} ${object}`.trim());
+  }
 
-  const shortPhraseSeed =
-    phraseParts.length > 0
-      ? phraseParts
-      : [
-          ...claim.keywords
-            .filter((word) => word.length >= 4 && !looksLikeTimeWord(word))
-            .slice(0, 5),
-        ];
+  if (action && object) {
+    querySet.add(`${action} ${object}`.trim());
+  }
 
-  const shortPhraseQuery =
-    shortPhraseSeed.length > 0
-      ? `"${shortPhraseSeed.join(" ")}"`
-      : `"${claim.cleanedText.split(" ").slice(0, 5).join(" ")}"`;
+  if (actor && action) {
+    querySet.add(`${actor} ${action}`.trim());
+  }
 
-  const entityExpanded = expandEntities(claim.entities);
-  const actionExpanded = expandActions(claim.actions);
+  if (object && location) {
+    querySet.add(`${object} ${location}`.trim());
+  }
 
-  const entityQuery =
-    entityExpanded.length > 0
-      ? `(${entityExpanded.slice(0, 8).join(" OR ")})`
-      : "";
+  if (actor && location) {
+    querySet.add(`${actor} ${location}`.trim());
+  }
 
-  const actionQuery =
-    actionExpanded.length > 0
-      ? `(${actionExpanded.slice(0, 8).join(" OR ")})`
-      : "";
+  if (eventModel.strongKeywords.length >= 3) {
+    querySet.add(eventModel.strongKeywords.slice(0, 4).join(" "));
+  }
 
-  const descriptorQuery =
-    claim.descriptors.length > 0
-      ? `(${claim.descriptors.slice(0, 3).join(" OR ")})`
-      : "";
+  if (aiClaim?.alternateFramings?.length) {
+    for (const framing of aiClaim.alternateFramings) {
+      if (framing && framing.trim().length >= 6) {
+        querySet.add(framing.trim());
+      }
+    }
+  }
 
-  const structuredQuery = [entityQuery, actionQuery, descriptorQuery]
+  return [...querySet]
     .filter(Boolean)
-    .join(" AND ");
-
-  const broadKeywordQuery = [
-    ...claim.entities,
-    ...claim.actions,
-    ...claim.descriptors,
-  ]
-    .filter((word) => word.length >= 4)
-    .slice(0, 8)
-    .join(" OR ");
-
-  const fallbackQuery = [
-    ...claim.entities.slice(0, 2),
-    ...claim.actions.slice(0, 2),
-    ...claim.descriptors.slice(0, 2),
-  ]
-    .filter((word) => word.length >= 4)
-    .join(" ");
-
-  return {
-    shortPhraseQuery,
-    structuredQuery,
-    broadKeywordQuery,
-    fallbackQuery,
-  };
+    .map((q) => q.trim())
+    .filter((q) => q.length >= 5)
+    .slice(0, MAX_QUERY_COUNT);
 }
 
-/**
- * News search
- */
-async function searchNews(query, pageSize = 8, language = null) {
-  if (!query || !query.trim()) {
-    return [];
-  }
+async function searchNews(query, pageSize = 8, language = "en") {
+  if (!NEWS_API_KEY) return [];
+  if (!query || !query.trim()) return [];
+
+  const cacheKey = `news:${language || "any"}:${pageSize}:${query}`;
+  const cached = getCache(newsCache, cacheKey);
+  if (cached) return cached;
 
   try {
     const params = {
@@ -656,35 +909,35 @@ async function searchNews(query, pageSize = 8, language = null) {
       sortBy: "publishedAt",
       pageSize,
       apiKey: NEWS_API_KEY,
+      from: recentDateIso(NEWS_LOOKBACK_DAYS),
     };
 
-    if (language) {
-      params.language = language;
-    }
+    if (language) params.language = language;
 
     const response = await axios.get("https://newsapi.org/v2/everything", {
       params,
+      timeout: REQUEST_TIMEOUT_MS,
     });
 
-    return response.data.articles || [];
+    const result = response.data?.articles || [];
+    setCache(newsCache, cacheKey, result);
+    return result;
   } catch (error) {
-    console.error(`Search failed for query: ${query}`);
-    console.error(error.response?.data || error.message);
+    if (DEBUG_MODE) {
+      console.error(`Search failed for query: ${query}`);
+      console.error(error.response?.data || error.message);
+    }
     return [];
   }
 }
 
 function dedupeArticles(articles) {
-  const seenTitles = new Set();
+  const seen = new Set();
 
   return articles.filter((article) => {
-    const normalizedTitle = normalizeText(article.title || "");
-
-    if (!normalizedTitle || seenTitles.has(normalizedTitle)) {
-      return false;
-    }
-
-    seenTitles.add(normalizedTitle);
+    const key = normalizeText(`${article.title || ""} ${extractDomain(article.url || "")}`);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
 }
@@ -694,15 +947,9 @@ function keepBestPerSource(articles) {
 
   for (const article of articles) {
     const sourceName = inferCanonicalSource(article).toLowerCase();
-
-    if (!bestBySource.has(sourceName)) {
-      bestBySource.set(sourceName, article);
-      continue;
-    }
-
     const existing = bestBySource.get(sourceName);
 
-    if ((article._score || 0) > (existing._score || 0)) {
+    if (!existing || (article._score || 0) > (existing._score || 0)) {
       bestBySource.set(sourceName, article);
     }
   }
@@ -710,102 +957,57 @@ function keepBestPerSource(articles) {
   return [...bestBySource.values()];
 }
 
-function articleText(article) {
-  return normalizeText(`${article.title || ""} ${article.description || ""}`);
-}
-
-function containsAnyPhrase(text, values) {
-  return values.some((value) => text.includes(value.toLowerCase()));
-}
-
-/**
- * Scoring helpers
- */
-function phraseMatchScore(claimText, articleCombinedText) {
-  const claimWords = tokenize(claimText, QUERY_STOP_WORDS).filter(
-    (word) => word.length >= 4 && !looksLikeTimeWord(word),
-  );
+function phraseMatchScore(eventModel, articleCombinedText) {
+  const claimWords = unique([
+    ...eventModel.keywords,
+    ...eventModel.event.actor.flatMap((x) => tokenize(x)),
+    ...eventModel.event.object.flatMap((x) => tokenize(x)),
+    ...eventModel.event.action.flatMap((x) => tokenize(x)),
+    ...eventModel.event.location.flatMap((x) => tokenize(x)),
+  ]).filter((word) => word.length >= 4 && !looksLikeTimeWord(word));
 
   const article = normalizeText(articleCombinedText);
   let matchCount = 0;
 
   for (const word of claimWords) {
-    if (article.includes(word)) {
-      matchCount += 1;
-    }
+    if (article.includes(word)) matchCount += 1;
   }
 
   return matchCount;
 }
 
-function semanticLiteScore(claim, articleCombinedText) {
+function semanticLiteScore(eventModel, articleCombinedText) {
   const claimTokens = new Set(
-    tokenize(claim.cleanedText, QUERY_STOP_WORDS).filter(
-      (word) => word.length >= 4 && !looksLikeTimeWord(word),
-    ),
+    unique([
+      ...eventModel.keywords,
+      ...eventModel.event.actor.flatMap((x) => tokenize(x)),
+      ...eventModel.event.action.flatMap((x) => tokenize(x)),
+      ...eventModel.event.object.flatMap((x) => tokenize(x)),
+      ...eventModel.event.location.flatMap((x) => tokenize(x)),
+    ]).filter((word) => word.length >= 4 && !looksLikeTimeWord(word)),
   );
 
   const articleTokens = new Set(
-    tokenize(articleCombinedText, SCORE_STOP_WORDS).filter(
-      (word) => word.length >= 4,
-    ),
+    tokenize(articleCombinedText, SCORE_STOP_WORDS).filter((word) => word.length >= 4),
   );
 
   let overlap = 0;
-
   for (const token of claimTokens) {
-    if (articleTokens.has(token)) {
-      overlap += 1;
-    }
+    if (articleTokens.has(token)) overlap += 1;
   }
 
-  const denominator = Math.max(claimTokens.size, 1);
-  return overlap / denominator;
+  return overlap / Math.max(claimTokens.size, 1);
 }
 
-function contradictionPenalty(claim, articleCombinedText) {
+function contradictionPenalty(eventModel, articleCombinedText) {
   const article = normalizeText(articleCombinedText);
   let penalty = 0;
 
-  if (claim.actions.includes("resume")) {
-    if (
-      article.includes("failed") ||
-      article.includes("collapse") ||
-      article.includes("collapsed") ||
-      article.includes("breakdown") ||
-      article.includes("stalled") ||
-      article.includes("blocked")
-    ) {
-      penalty += 4;
-    }
-  }
-
-  if (claim.actions.includes("win")) {
-    if (
-      article.includes("lost") ||
-      article.includes("defeat") ||
-      article.includes("defeated")
-    ) {
-      penalty += 4;
-    }
-  }
-
-  if (claim.actions.includes("rise")) {
-    if (
-      article.includes("fell") ||
-      article.includes("drop") ||
-      article.includes("decline")
-    ) {
+  for (const [left, right] of CONTRADICTION_PAIRS) {
+    if (eventModel.event.action.includes(left) && article.includes(right)) {
       penalty += 3;
     }
-  }
-
-  if (claim.actions.includes("fall")) {
-    if (
-      article.includes("rise") ||
-      article.includes("surge") ||
-      article.includes("jump")
-    ) {
+    if (eventModel.event.action.includes(right) && article.includes(left)) {
       penalty += 3;
     }
   }
@@ -814,9 +1016,7 @@ function contradictionPenalty(claim, articleCombinedText) {
 }
 
 function trustedSourceBonus(article) {
-  const canonical = inferCanonicalSource(article).toLowerCase();
-  if (isTrustedSourceName(canonical)) return 5;
-  return 0;
+  return isTrustedSourceName(inferCanonicalSource(article).toLowerCase()) ? 5 : 0;
 }
 
 function weakSourcePenalty(article) {
@@ -824,104 +1024,210 @@ function weakSourcePenalty(article) {
   const domain = extractDomain(article.url || "");
 
   for (const weak of WEAK_SOURCE_PATTERNS) {
-    if (sourceName.includes(weak) || domain.includes(weak)) {
-      return 5;
-    }
+    if (sourceName.includes(weak) || domain.includes(weak)) return 5;
   }
 
   return 0;
 }
 
-function scoreArticle(claim, article) {
+function recencyBonus(article) {
+  const published = article.publishedAt ? new Date(article.publishedAt).getTime() : null;
+  if (!published || Number.isNaN(published)) return 0;
+
+  const ageDays = Math.max(0, (Date.now() - published) / (1000 * 60 * 60 * 24));
+  if (ageDays <= 2) return 4;
+  if (ageDays <= 7) return 3;
+  if (ageDays <= 14) return 2;
+  if (ageDays <= 30) return 1;
+  return 0;
+}
+
+function getArticleAgeHours(article) {
+  const published = article.publishedAt ? new Date(article.publishedAt).getTime() : null;
+  if (!published || Number.isNaN(published)) return null;
+  return (Date.now() - published) / (1000 * 60 * 60);
+}
+
+function splitRecentVsOlderArticles(articles, recentHours = 18) {
+  const recent = [];
+  const older = [];
+
+  for (const article of articles) {
+    const ageHours = getArticleAgeHours(article);
+    if (ageHours !== null && ageHours <= recentHours) {
+      recent.push(article);
+    } else {
+      older.push(article);
+    }
+  }
+
+  return { recent, older };
+}
+
+function detectStatusChangeSignals(text) {
+  const t = normalizeText(text);
+
+  return {
+    extensionPositive:
+      t.includes("extended") ||
+      t.includes("extension approved") ||
+      t.includes("extension granted") ||
+      t.includes("ceasefire extended"),
+
+    extensionNegative:
+      t.includes("highly unlikely") ||
+      t.includes("unlikely") ||
+      t.includes("will not extend") ||
+      t.includes("no extension") ||
+      t.includes("ceasefire ends"),
+
+    activeNow:
+      t.includes("still in effect") ||
+      t.includes("remains in effect") ||
+      t.includes("currently active"),
+  };
+}
+
+function hasNewerOverride(scoredArticles) {
+  const { recent, older } = splitRecentVsOlderArticles(scoredArticles, 18);
+
+  if (!recent.length || !older.length) return false;
+
+  const recentText = recent.map((a) => articleText(a)).join(" ");
+  const olderText = older.map((a) => articleText(a)).join(" ");
+
+  const recentSignals = detectStatusChangeSignals(recentText);
+  const olderSignals = detectStatusChangeSignals(olderText);
+
+  if (olderSignals.extensionNegative && recentSignals.extensionPositive) {
+    return true;
+  }
+
+  if (olderSignals.extensionNegative && recentSignals.activeNow) {
+    return true;
+  }
+
+  return false;
+}
+
+function passesCoreMatch(eventModel, article) {
+  const combined = articleText(article);
+
+  const actorMatch =
+    eventModel.event.actor.length === 0 ||
+    containsAnyPhrase(combined, expandEntities(eventModel.event.actor));
+
+  const actionMatch =
+    eventModel.event.action.length === 0 ||
+    containsAnyPhrase(combined, expandActions(eventModel.event.action));
+
+  const objectMatch =
+    eventModel.event.object.length === 0 ||
+    containsAnyPhrase(combined, expandEntities(eventModel.event.object));
+
+  const matches = [actorMatch, actionMatch, objectMatch].filter(Boolean).length;
+  return matches >= 2;
+}
+
+function sameEventHeuristic(eventModel, article) {
+  const combined = articleText(article);
+
+  const actorMatch =
+    eventModel.event.actor.length === 0 ||
+    containsAnyPhrase(combined, expandEntities(eventModel.event.actor));
+  const actionMatch =
+    eventModel.event.action.length === 0 ||
+    containsAnyPhrase(combined, expandActions(eventModel.event.action));
+  const objectMatch =
+    eventModel.event.object.length === 0 ||
+    containsAnyPhrase(combined, expandEntities(eventModel.event.object));
+  const locationMatch =
+    eventModel.event.location.length === 0 ||
+    containsAnyPhrase(combined, expandEntities(eventModel.event.location));
+
+  const exactness = [actorMatch, actionMatch, objectMatch, locationMatch].filter(Boolean).length;
+
+  if (actorMatch && actionMatch && objectMatch) return "same_event";
+  if (exactness >= 2) return "same_topic";
+  return "background";
+}
+
+function scoreArticle(eventModel, article) {
   const combinedText = articleText(article);
   const tokens = new Set(tokenize(combinedText, SCORE_STOP_WORDS));
 
-  let entityScore = 0;
+  let actorScore = 0;
   let actionScore = 0;
-  let effectScore = 0;
-  let descriptorScore = 0;
+  let objectScore = 0;
+  let locationScore = 0;
   let numberScore = 0;
   let keywordScore = 0;
 
-  const expandedEntities = expandEntities(claim.entities);
-  const expandedActions = expandActions(claim.actions);
-  const effectTerms = detectEffectTerms(claim);
+  const expandedActors = expandEntities(eventModel.event.actor);
+  const expandedActions = expandActions(eventModel.event.action);
+  const expandedObjects = expandEntities(eventModel.event.object);
+  const expandedLocations = expandEntities(eventModel.event.location);
+  const effectTerms = detectEffectTerms(eventModel);
   const expandedEffectTerms = expandActions(effectTerms);
+  const primaryAnchor = detectPrimaryAnchor(eventModel);
 
-  const primaryAnchor = detectPrimaryAnchor(claim);
   const anchorMatched =
-    !primaryAnchor ||
-    containsAnyPhrase(combinedText, expandEntities([primaryAnchor]));
+    !primaryAnchor || containsAnyPhrase(combinedText, expandEntities([primaryAnchor]));
 
-  if (
-    expandedEntities.length > 0 &&
-    containsAnyPhrase(combinedText, expandedEntities)
-  ) {
-    entityScore += 3;
+  if (expandedActors.length && containsAnyPhrase(combinedText, expandedActors)) actorScore += 4;
+  if (expandedActions.length && containsAnyPhrase(combinedText, expandedActions)) actionScore += 4;
+  if (expandedObjects.length && containsAnyPhrase(combinedText, expandedObjects)) objectScore += 5;
+  if (expandedLocations.length && containsAnyPhrase(combinedText, expandedLocations)) locationScore += 2;
+
+  if (expandedEffectTerms.length && containsAnyPhrase(combinedText, expandedEffectTerms)) {
+    objectScore += 2;
   }
 
-  if (
-    expandedActions.length > 0 &&
-    containsAnyPhrase(combinedText, expandedActions)
-  ) {
-    actionScore += 3;
+  for (const number of eventModel.numbers) {
+    if (combinedText.includes(number)) numberScore += 2;
   }
 
-  if (
-    expandedEffectTerms.length > 0 &&
-    containsAnyPhrase(combinedText, expandedEffectTerms)
-  ) {
-    effectScore += 3;
+  for (const keyword of eventModel.strongKeywords) {
+    if (tokens.has(keyword)) keywordScore += 1;
   }
 
-  for (const descriptor of claim.descriptors) {
-    if (tokens.has(descriptor)) {
-      descriptorScore += 1;
-    }
-  }
-
-  for (const number of claim.numbers) {
-    if (combinedText.includes(number)) {
-      numberScore += 2;
-    }
-  }
-
-  for (const keyword of claim.strongKeywords) {
-    if (tokens.has(keyword)) {
-      keywordScore += 1;
-    }
-  }
-
-  const phraseScore = phraseMatchScore(claim.cleanedText, combinedText);
-  const semanticScore = semanticLiteScore(claim, combinedText);
-  const contradiction = contradictionPenalty(claim, combinedText);
+  const phraseScore = phraseMatchScore(eventModel, combinedText);
+  const semanticScore = semanticLiteScore(eventModel, combinedText);
+  const contradiction = contradictionPenalty(eventModel, combinedText);
   const trustBonus = trustedSourceBonus(article);
   const weakPenalty = weakSourcePenalty(article);
+  const recentBonus = recencyBonus(article);
+  const sameEventBucket = sameEventHeuristic(eventModel, article);
 
-  const totalScore =
-    entityScore +
+  let totalScore =
+    actorScore +
     actionScore +
-    effectScore +
-    descriptorScore +
+    objectScore +
+    locationScore +
     numberScore +
     keywordScore +
     phraseScore +
-    semanticScore * 4 +
-    trustBonus -
+    semanticScore * 5 +
+    trustBonus +
+    recentBonus -
     contradiction -
     weakPenalty;
 
-  const hasEntitySupport = claim.entities.length === 0 || entityScore >= 3;
-  const hasActionSupport = claim.actions.length === 0 || actionScore >= 3;
+  if (!anchorMatched) totalScore -= 3;
+  if (sameEventBucket === "same_topic") totalScore -= 2;
+  if (sameEventBucket === "background") totalScore -= 5;
+
+  const hasActorSupport = eventModel.event.actor.length === 0 || actorScore >= 4;
+  const hasActionSupport = eventModel.event.action.length === 0 || actionScore >= 4;
+  const hasObjectSupport = eventModel.event.object.length === 0 || objectScore >= 5;
   const hasPhraseSupport = phraseScore >= 2;
-  const hasEffectSupport = effectTerms.length === 0 || effectScore >= 3;
 
   return {
     totalScore,
-    entityScore,
+    actorScore,
     actionScore,
-    effectScore,
-    descriptorScore,
+    objectScore,
+    locationScore,
     numberScore,
     keywordScore,
     phraseScore,
@@ -929,267 +1235,379 @@ function scoreArticle(claim, article) {
     contradictionPenalty: contradiction,
     trustBonus,
     weakSourcePenalty: weakPenalty,
+    recentBonus,
     canonicalSource: inferCanonicalSource(article),
     anchorMatched,
-    hasCoreSupport:
-      hasEntitySupport &&
-      hasActionSupport &&
-      hasPhraseSupport &&
-      hasEffectSupport,
+    sameEventBucket,
+    hasCoreSupport: hasActorSupport && hasActionSupport && hasObjectSupport && hasPhraseSupport,
   };
 }
 
-/**
- * Result helpers
- */
+async function compareClaimToArticlesWithAI(aiClaim, articles) {
+  if (!aiClaim || !articles.length) return null;
+
+  const compactArticles = articles.slice(0, 5).map((article, index) => ({
+    id: index + 1,
+    title: article.title || "",
+    description: article.description || "",
+    source: inferCanonicalSource(article),
+  }));
+
+  const prompt = `
+You are helping a fact-checking assistant compare a claim against news articles.
+
+Return JSON only in this exact shape:
+{
+  "matches": [
+    {
+      "id": 1,
+      "sameEvent": true,
+      "verdict": "supporting",
+      "confidence": 0,
+      "reason": "short string"
+    }
+  ]
+}
+
+Rules:
+- verdict must be one of: supporting, partial, conflicting, unrelated
+- confidence must be a number from 0 to 100
+- Use the article ids given below
+- Compare the real-world event, not just topical similarity
+- Return valid JSON only
+
+Claim summary:
+${JSON.stringify(aiClaim, null, 2)}
+
+Articles:
+${JSON.stringify(compactArticles, null, 2)}
+`;
+
+  const response = await askLocalAI(prompt, {
+    temperature: 0.1,
+    timeout: REQUEST_TIMEOUT_MS,
+  });
+
+  const parsed = safeJsonParse(response);
+  if (!parsed || !Array.isArray(parsed.matches)) return null;
+  return parsed.matches;
+}
+
 function countUniqueSources(articles) {
   return new Set(
     articles.map((article) => inferCanonicalSource(article).toLowerCase()),
   ).size;
 }
 
-function computeConfidence(relevantArticles) {
-  if (!relevantArticles.length) return 22;
+function computeConfidence(relevantArticles, aiMatches = []) {
+  if (!relevantArticles.length) return 20;
 
   const avgScore =
-    relevantArticles.reduce((sum, article) => sum + article._score, 0) /
-    relevantArticles.length;
+    relevantArticles.reduce((sum, article) => sum + article._score, 0) / relevantArticles.length;
 
   const uniqueSources = countUniqueSources(relevantArticles);
-  const strongPhraseMatches = relevantArticles.filter(
-    (article) => article._detail.phraseScore >= 3,
+
+  const sameEventArticles = relevantArticles.filter(
+    (article) => article._detail.sameEventBucket === "same_event",
   ).length;
 
-  let confidence = 35;
-  confidence += Math.min(avgScore * 3, 30);
-  confidence += Math.min(uniqueSources * 6, 18);
-  confidence += Math.min(strongPhraseMatches * 4, 12);
+  const supportingAiMatches = aiMatches.filter(
+    (item) => item.sameEvent && item.verdict === "supporting",
+  ).length;
+
+  let confidence = 20;
+  confidence += Math.min(avgScore * 1.5, 25);
+  confidence += Math.min(uniqueSources * 5, 20);
+  confidence += Math.min(sameEventArticles * 8, 24);
+  confidence += Math.min(supportingAiMatches * 10, 20);
+
+  if (sameEventArticles < 2) {
+    confidence = Math.min(confidence, 65);
+  }
+
+  if (supportingAiMatches < 2) {
+    confidence = Math.min(confidence, 60);
+  }
+
+  if (hasNewerOverride(relevantArticles)) {
+    confidence = Math.min(confidence, 35);
+  }
 
   return Math.max(0, Math.min(100, Math.round(confidence)));
 }
 
-function buildExplanation(
-  resultType,
-  claim,
-  relevantArticles,
-  responseStyle = "medium",
-) {
-  const primaryAnchor = detectPrimaryAnchor(claim);
-  const anchorText = primaryAnchor ? primaryAnchor : "the claim";
+function buildExplanation(resultType, eventModel, relevantArticles, responseStyle = "medium") {
+  const primaryAnchor = detectPrimaryAnchor(eventModel) || "the claim";
   const uniqueSources = countUniqueSources(relevantArticles);
+
+  if (hasNewerOverride(relevantArticles)) {
+    return "Haven found older coverage that supports this claim, but newer reporting suggests the situation has changed or been reversed.";
+  }
 
   if (resultType === "strong") {
     if (responseStyle === "short") {
-      return `Haven found strong corroboration from multiple sources for ${anchorText}.`;
+      return `Haven found strong corroboration from multiple sources for ${primaryAnchor}.`;
     }
     if (responseStyle === "detailed") {
-      return `Haven found strong corroboration across ${uniqueSources} different sources. The retrieved articles align closely with the main entities and actions in the claim, and multiple outlets point to the same event rather than only a related topic.`;
+      return `Haven found strong corroboration across ${uniqueSources} different sources. Multiple articles align with the core actor, action, and object of the claim, and the retrieved coverage appears to describe the same event rather than only a loosely related topic.`;
     }
-    return `Haven found strong corroboration across ${uniqueSources} different sources, with several articles closely matching the core claim.`;
+    return `Haven found strong corroboration across ${uniqueSources} sources, with several articles closely matching the core event.`;
   }
 
   if (resultType === "developing") {
-    if (responseStyle === "short") {
-      return `Haven found some support, but the exact claim is still developing.`;
-    }
-    if (responseStyle === "detailed") {
-      return `Haven found related corroborating coverage from multiple sources, but support for the exact claim is still developing. Some articles align with the main event, while parts such as timing, attribution, or exact wording may still be limited or only partially confirmed.`;
-    }
-    return `Haven found related corroborating coverage, but support for the exact claim is still developing.`;
+    return "Haven found related corroborating coverage, but support for the exact claim is still developing.";
   }
 
   if (resultType === "weak") {
-    if (responseStyle === "short") {
-      return `Haven found limited support so far.`;
-    }
-    if (responseStyle === "detailed") {
-      return `Haven found only limited support. One closely related article may align with the claim, but there is not enough corroboration from multiple strong sources to treat it as well confirmed yet.`;
-    }
-    return `Haven found limited support so far, with not enough corroboration to confidently verify the claim.`;
+    return "Haven found limited support so far, with not enough corroboration to confidently verify the claim.";
   }
 
-  if (responseStyle === "short") {
-    return `Haven could not find strong corroboration for this claim.`;
-  }
-  if (responseStyle === "detailed") {
-    return `Haven could not find strong corroboration for this claim. The retrieved coverage may be loosely related, conflicting, or insufficient to verify the same event with confidence.`;
-  }
-  return `Haven could not find strong corroboration for this claim from the retrieved sources.`;
+  return "Haven could not find strong corroboration for this claim from the retrieved sources.";
 }
 
 function buildSpokenSummary(status, confidence, explanation) {
   return `${status}. Confidence ${confidence} percent. ${explanation}`;
 }
 
-/**
- * Main route
- */
-app.post("/check", async (req, res) => {
-  const {
-    text,
-    languageMode = "english",
-    responseStyle = "medium", // short | medium | detailed
-  } = req.body;
+function buildFinalVerdictFromAI(scoredArticles, aiMatches) {
+  const uniqueSources = countUniqueSources(scoredArticles);
 
-  if (!text || !text.trim()) {
+  if (!aiMatches || !aiMatches.length) {
+    if (scoredArticles.length >= 4 && uniqueSources >= 3) {
+      return { resultType: "strong", status: "Strongly Corroborated", level: "safe" };
+    }
+    if (scoredArticles.length >= 2 && uniqueSources >= 2) {
+      return { resultType: "developing", status: "Developing Support", level: "warning" };
+    }
+    if (scoredArticles.length === 1) {
+      return { resultType: "weak", status: "Weak Support", level: "warning" };
+    }
+    return { resultType: "unverified", status: "Unverified / Needs Caution", level: "warning" };
+  }
+
+  const supporting = aiMatches.filter(
+    (item) => item.sameEvent && item.verdict === "supporting",
+  ).length;
+
+  const partial = aiMatches.filter(
+    (item) => item.sameEvent && item.verdict === "partial",
+  ).length;
+
+  const conflicting = aiMatches.filter(
+    (item) => item.sameEvent && item.verdict === "conflicting",
+  ).length;
+
+  if (supporting >= 3 && uniqueSources >= 3) {
+    return { resultType: "strong", status: "Strongly Corroborated", level: "safe" };
+  }
+
+  if (supporting + partial >= 2 && conflicting === 0) {
+    return { resultType: "developing", status: "Developing Support", level: "warning" };
+  }
+
+  if (conflicting >= 2) {
+    return { resultType: "unverified", status: "Conflicting Coverage", level: "warning" };
+  }
+
+  if (supporting === 1 || partial === 1) {
+    return { resultType: "weak", status: "Weak Support", level: "warning" };
+  }
+
+  return { resultType: "unverified", status: "Unverified / Needs Caution", level: "warning" };
+}
+
+app.post("/test-ai", async (req, res) => {
+  if (DEBUG_MODE) console.log("🧪 /test-ai endpoint hit");
+
+  const text = cleanInputText(req.body?.text);
+
+  if (!text) {
+    return res.status(400).json({ error: "No text provided." });
+  }
+
+  const strippedText = stripAttribution(text);
+  const eventModel = buildEventModel(strippedText);
+  const aiClaim = await parseClaimWithAI(strippedText);
+  const queryList = buildQueriesFromEvent(eventModel, aiClaim);
+
+  if (DEBUG_MODE) {
+    console.log("Original text:", text);
+    console.log("Stripped text:", strippedText);
+    console.log("Event model:", eventModel);
+    console.log("AI claim parse:", aiClaim);
+    console.log("Query list:", queryList);
+  }
+
+  return res.json({
+    ok: true,
+    originalText: text,
+    strippedText,
+    eventModel,
+    aiClaim,
+    queryList,
+  });
+});
+
+app.post("/check", async (req, res) => {
+  if (DEBUG_MODE) console.log("🔥 /check endpoint hit");
+
+  const text = cleanInputText(req.body?.text);
+  const languageMode = req.body?.languageMode || "english";
+  const responseStyle = req.body?.responseStyle || "medium";
+
+  if (!text) {
     return res.status(400).json({
       status: "Scan Failed",
       level: "danger",
       confidence: 0,
       explanation: "No usable text was provided.",
       spokenSummary: "Scan failed. No usable text was provided.",
+      sources: [],
+    });
+  }
+
+  if (!NEWS_API_KEY) {
+    return res.status(500).json({
+      status: "Config Error",
+      level: "danger",
+      confidence: 0,
+      explanation: "NEWS_API_KEY is missing from your environment.",
+      spokenSummary: "Configuration error. News API key is missing.",
+      sources: [],
     });
   }
 
   try {
-    const claim = buildClaimModel(text);
-    const queries = buildQueries(claim);
-
-    console.log("\n--- NEW SCAN ---");
-    console.log("Original text:", text);
-    console.log("Cleaned text:", claim.cleanedText);
-    console.log("Claim model:", claim);
-    console.log("Short phrase query:", queries.shortPhraseQuery);
-    console.log("Structured query:", queries.structuredQuery);
-    console.log("Broad keyword query:", queries.broadKeywordQuery);
-    console.log("Fallback query:", queries.fallbackQuery);
-    console.log("Language mode:", languageMode);
-    console.log("Response style:", responseStyle);
-
+    const strippedText = stripAttribution(text);
+    const eventModel = buildEventModel(strippedText);
+    const aiClaim = await parseClaimWithAI(strippedText);
+    const queryList = buildQueriesFromEvent(eventModel, aiClaim);
     const language = languageMode === "any" ? null : "en";
 
-    const [
-      phraseArticles,
-      structuredArticles,
-      broadArticles,
-      fallbackArticles,
-    ] = await Promise.all([
-      searchNews(queries.shortPhraseQuery, 12, language),
-      searchNews(queries.structuredQuery, 20, language),
-      searchNews(queries.broadKeywordQuery, 20, language),
-      searchNews(queries.fallbackQuery, 12, language),
-    ]);
-
-    console.log("Phrase articles found:", phraseArticles.length);
-    console.log("Structured articles found:", structuredArticles.length);
-    console.log("Broad articles found:", broadArticles.length);
-    console.log("Fallback articles found:", fallbackArticles.length);
-
-    const combinedArticles = dedupeArticles([
-      ...phraseArticles,
-      ...structuredArticles,
-      ...broadArticles,
-      ...fallbackArticles,
-    ]);
-
-    let scoredArticles = combinedArticles
-      .map((article) => {
-        const score = scoreArticle(claim, article);
-
-        return {
-          ...article,
-          _score: score.totalScore,
-          _detail: score,
-        };
-      })
-      .filter((article) => {
-        return (
-          article._score >= 8 &&
-          article._detail.hasCoreSupport &&
-          article._detail.anchorMatched
-        );
-      })
-      .sort((a, b) => b._score - a._score);
-
-    scoredArticles = keepBestPerSource(scoredArticles).sort(
-      (a, b) => b._score - a._score,
-    );
-
-    console.log("Relevant articles after filtering:", scoredArticles.length);
-    scoredArticles.forEach((article, index) => {
-      console.log(
-        `${index + 1}. [score=${article._score.toFixed(2)}] ${inferCanonicalSource(article)} - ${article.title}`,
-      );
-    });
-
-    const uniqueSources = countUniqueSources(scoredArticles);
-    const strongPhraseMatches = scoredArticles.filter(
-      (article) => article._detail.phraseScore >= 3,
-    ).length;
-    const strongEffectMatches = scoredArticles.filter(
-      (article) => (article._detail.effectScore || 0) >= 3,
-    ).length;
-
-    let resultType = "unverified";
-    let status = "Unverified / Needs Caution";
-    let level = "warning";
-
-    if (
-      scoredArticles.length >= 5 &&
-      uniqueSources >= 4 &&
-      strongPhraseMatches >= 3 &&
-      strongEffectMatches >= 2
-    ) {
-      resultType = "strong";
-      status = "Strongly Corroborated";
-      level = "safe";
-    } else if (scoredArticles.length >= 2 && uniqueSources >= 2) {
-      resultType = "developing";
-      status = "Developing Support";
-      level = "warning";
-    } else if (scoredArticles.length === 1) {
-      resultType = "weak";
-      status = "Weak Support";
-      level = "warning";
+    if (DEBUG_MODE) {
+      console.log("\n--- NEW SCAN ---");
+      console.log("Original text:", text);
+      console.log("Stripped text:", strippedText);
+      console.log("Event model:", JSON.stringify(eventModel, null, 2));
+      console.log("AI claim parse:", JSON.stringify(aiClaim, null, 2));
+      console.log("Query list:", queryList);
+      console.log("Language mode:", languageMode);
+      console.log("Response style:", responseStyle);
     }
 
-    const confidence = computeConfidence(scoredArticles);
+    const searchResults = await Promise.all(
+      queryList.map((query, index) => searchNews(query, index === 0 ? 12 : 8, language)),
+    );
+
+    const resultBreakdown = searchResults.map((items, idx) => ({
+      query: queryList[idx],
+      count: items.length,
+    }));
+
+    const combinedArticles = dedupeArticles(searchResults.flat());
+
+    let scoredArticles = combinedArticles
+      .filter(isAllowedArticle)
+      .filter((article) => passesCoreMatch(eventModel, article))
+      .map((article) => {
+        const detail = scoreArticle(eventModel, article);
+        return {
+          ...article,
+          _score: detail.totalScore,
+          _detail: detail,
+        };
+      })
+      .filter((article) => article._score >= 7)
+      .sort((a, b) => b._score - a._score);
+
+    scoredArticles = keepBestPerSource(scoredArticles)
+      .sort((a, b) => b._score - a._score)
+      .slice(0, 8);
+
+    const aiMatches = await compareClaimToArticlesWithAI(aiClaim, scoredArticles);
+
+    let verdict = buildFinalVerdictFromAI(scoredArticles, aiMatches || []);
+    if (hasNewerOverride(scoredArticles)) {
+      verdict = {
+        resultType: "unverified",
+        status: "Outdated Or Reversed",
+        level: "warning",
+      };
+    }
+
+    const confidence = computeConfidence(scoredArticles, aiMatches || []);
     const explanation = buildExplanation(
-      resultType,
-      claim,
+      verdict.resultType,
+      eventModel,
       scoredArticles,
       responseStyle,
     );
-    const spokenSummary = buildSpokenSummary(status, confidence, explanation);
+    const spokenSummary = buildSpokenSummary(
+      verdict.status,
+      confidence,
+      explanation,
+    );
+
+    if (DEBUG_MODE) {
+      console.log("Search results by query:", resultBreakdown);
+      console.log("Combined deduped articles:", combinedArticles.length);
+      console.log("Relevant articles after filtering:", scoredArticles.length);
+      scoredArticles.forEach((article, index) => {
+        console.log(
+          `${index + 1}. [score=${article._score.toFixed(2)}] ${inferCanonicalSource(article)} - ${article.title}`,
+        );
+      });
+      console.log("Has newer override:", hasNewerOverride(scoredArticles));
+      console.log("Final verdict:", verdict);
+      console.log("Confidence:", confidence);
+      console.log("AI matches:", aiMatches);
+    }
 
     return res.json({
-      status,
-      level,
+      status: verdict.status,
+      level: verdict.level,
       confidence,
       explanation,
       spokenSummary,
-      debug: {
-        claim,
-        queries,
-        totalFetched: combinedArticles.length,
-        matchedCount: scoredArticles.length,
-        uniqueSources,
-        strongPhraseMatches,
-        strongEffectMatches,
-        languageMode,
-        responseStyle,
-      },
-      sources: scoredArticles.slice(0, 5).map((article) => ({
+      sources: scoredArticles.slice(0, 5).map((article, index) => ({
+        id: index + 1,
         title: article.title,
         source: inferCanonicalSource(article),
         originalSource: article.source?.name || "Unknown Source",
         url: article.url,
+        publishedAt: article.publishedAt || null,
         score: Number(article._score.toFixed(2)),
-        breakdown: article._detail,
+        aiMatch: aiMatches?.find((item) => item.id === index + 1) || null,
+        sameEventBucket: article._detail.sameEventBucket,
       })),
+      debug: DEBUG_MODE
+        ? {
+            originalText: text,
+            strippedText,
+            eventModel,
+            aiClaim,
+            queryList,
+            totalFetched: combinedArticles.length,
+            matchedCount: scoredArticles.length,
+            aiMatches,
+            languageMode,
+            responseStyle,
+            resultBreakdown,
+            newerOverride: hasNewerOverride(scoredArticles),
+          }
+        : undefined,
     });
   } catch (error) {
-    console.error("NewsAPI error:", error.response?.data || error.message);
+    console.error("Check error:", error.response?.data || error.message);
 
     if (error.response?.status === 429) {
       return res.status(429).json({
         status: "Limit Reached",
         level: "danger",
         confidence: 0,
-        explanation:
-          "Daily news lookup limit reached. Please try again tomorrow.",
-        spokenSummary:
-          "Haven reached the daily news lookup limit. Please try again tomorrow.",
+        explanation: "Daily news lookup limit reached. Please try again later.",
+        spokenSummary: "Haven reached the daily news lookup limit. Please try again later.",
+        sources: [],
       });
     }
 
@@ -1199,10 +1617,15 @@ app.post("/check", async (req, res) => {
       confidence: 0,
       explanation: "There was a problem checking this claim. Please try again.",
       spokenSummary: "Scan failed. There was a problem checking this claim.",
+      sources: [],
     });
   }
 });
 
 app.listen(PORT, () => {
   console.log(`Haven backend running at http://localhost:${PORT}`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Debug ping: http://localhost:${PORT}/debug-ping`);
+  console.log(`Test AI route: POST http://localhost:${PORT}/test-ai`);
+  console.log(`Full fact-check route: POST http://localhost:${PORT}/check`);
 });
