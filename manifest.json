@@ -6,8 +6,15 @@
   "action": {
     "default_popup": "popup.html"
   },
-  "permissions": ["activeTab", "tabs"],
-  "host_permissions": ["<all_urls>", "http://localhost:3000/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["activeTab", "tabs", "scripting", "storage"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://localhost:3000/*",
+    "https://amqxelapdljxeujuduye.supabase.co/*"
+  ],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
