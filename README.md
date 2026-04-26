@@ -1,4 +1,4 @@
-# Haven — Keeping the Source Safe
+# Haven — detecting lies alongside you
 
 > A Chrome extension that helps you verify what you see online in real time.
 
