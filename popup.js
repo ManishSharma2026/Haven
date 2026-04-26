@@ -293,6 +293,63 @@ function initMainApp() {
     }
   });
 
+  // ── Voice system ───────────────────────────────────────────────────────────
+  let voiceEnabled  = false;
+  let currentAudio  = null;
+  const voiceBtn    = document.getElementById("voiceToggle");
+  const voiceDesc   = document.getElementById("voiceDesc");
+
+  async function loadVoicePref() {
+    const stored = await chrome.storage.local.get("havenVoice");
+    voiceEnabled  = stored.havenVoice !== false; // default ON
+    updateVoiceUI();
+  }
+
+  function updateVoiceUI() {
+    if (voiceEnabled) {
+      voiceBtn.classList.add("on");
+      voiceDesc.textContent = "Reads results aloud via ElevenLabs";
+    } else {
+      voiceBtn.classList.remove("on");
+      voiceDesc.textContent = "Voice readout is off";
+    }
+  }
+
+  voiceBtn.addEventListener("click", async () => {
+    voiceEnabled = !voiceEnabled;
+    await chrome.storage.local.set({ havenVoice: voiceEnabled });
+    updateVoiceUI();
+    if (!voiceEnabled && currentAudio) {
+      currentAudio.pause();
+      currentAudio = null;
+    }
+  });
+
+  async function speak(text) {
+    if (!voiceEnabled || !text) return;
+    if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+
+    try {
+      const res = await fetch("http://localhost:3000/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text.slice(0, 400) }),
+      });
+
+      if (!res.ok) return;
+
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      currentAudio = new Audio(url);
+      currentAudio.play();
+      currentAudio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; };
+    } catch {
+      // Voice failed silently
+    }
+  }
+
+  loadVoicePref();
+
   // ── Pending image result ───────────────────────────────────────────────────
   chrome.storage.local.get("havenImageResult", async (stored) => {
     if (!stored.havenImageResult) return;
@@ -321,6 +378,7 @@ function initMainApp() {
       const data = await res.json();
       const conf = data.confidence > 0 ? ` — ${data.confidence}% confidence` : "";
       setResult(data.status, data.explanation + conf, "AI LENS");
+      speak(`${data.status}. ${data.explanation}`);
     } catch {
       setResult("Scan Failed", "Make sure the Haven server is running.", "AI LENS");
     }
@@ -352,7 +410,7 @@ function initMainApp() {
       const text = response.selectedText || response.heading || response.bodyText || response.title;
       if (!text) { setResult("Scan Failed", "No readable text found on this page."); return; }
 
-      setScanning("Analysing", "Checking claim against news sources…", "MISINFO LENS");
+      setScanning("Analysing", "Searching news sources and ranking articles…", "MISINFO LENS");
 
       try {
         const res  = await fetch("http://localhost:3000/check", {
@@ -361,7 +419,20 @@ function initMainApp() {
           body: JSON.stringify({ text }),
         });
         const data = await res.json();
-        setResult(data.status, data.explanation, "MISINFO LENS");
+
+        // Build detail with article stats
+        let detail = data.explanation || "";
+
+        if (data.knowledgeVerdict) {
+          detail = data.explanation;
+        } else if (data.sources && data.sources.length > 0) {
+          const total   = data.debug?.totalFetched || "?";
+          const matched = data.debug?.matchedCount || data.sources.length;
+          detail += `\n\n📰 ${total} articles scanned · ${matched} relevant · ${data.sources.length} sources used`;
+        }
+
+        setResult(data.status, detail, "MISINFO LENS");
+        speak(`${data.status}. ${data.explanation}`);
       } catch {
         setResult("Scan Failed", "Make sure the Haven server is running.", "MISINFO LENS");
       }
