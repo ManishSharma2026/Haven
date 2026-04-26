@@ -152,21 +152,28 @@ router.post("/check", async (req, res) => {
     }
 
     // ── Layer 2: Event modeling + AI claim parsing ─────────────────────────
+    // Build event model instantly (no AI needed)
     const eventModel = buildEventModel(strippedText);
-    const aiClaim    = await parseClaimWithAI(strippedText);
-    const queryList  = buildQueriesFromEvent(eventModel, aiClaim);
-    const language   = languageMode === "any" ? null : "en";
 
-    if (DEBUG_MODE) {
-      console.log("Event model:", JSON.stringify(eventModel, null, 2));
-      console.log("AI claim:", JSON.stringify(aiClaim, null, 2));
-      console.log("Queries:", queryList);
-    }
+    // Run AI claim parsing and first keyword search IN PARALLEL
+    // This saves ~8 seconds by not waiting for AI before searching
+    const quickKeywords = eventModel.strongKeywords.slice(0, 4).join(" ");
+    const language = languageMode === "any" ? null : "en";
 
-    // ── Layer 3: News API search ───────────────────────────────────────────
-    const searchResults = await Promise.all(
-      queryList.map((query, index) => searchNews(query, index === 0 ? 12 : 8, language))
+    const [aiClaim, firstResults] = await Promise.all([
+      parseClaimWithAI(strippedText),
+      searchNews(quickKeywords, 8, language),
+    ]);
+
+    const queryList = buildQueriesFromEvent(eventModel, aiClaim);
+
+    // Search remaining queries (skip first since we already have it)
+    const remainingQueries = queryList.filter(q => q !== quickKeywords).slice(0, 2);
+    const remainingResults = await Promise.all(
+      remainingQueries.map((query) => searchNews(query, 6, language))
     );
+
+    const searchResults = [firstResults, ...remainingResults];
 
     const resultBreakdown = searchResults.map((items, idx) => ({
       query: queryList[idx],
