@@ -1,125 +1,158 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Haven</title>
-    <link rel="stylesheet" href="popup.css" />
-  </head>
-  <body>
-    <!-- Login -->
-    <div id="screenLogin" class="screen hidden">
-      <div class="card">
-        <div class="glow glow-1"></div><div class="glow glow-2"></div>
-        <div class="top">
-          <div class="logo-wrap">
-            <div class="logo">H</div>
-            <div><h1>Haven</h1><p class="subtitle">Sign in to continue</p></div>
-          </div>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Haven</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+
+  <!-- Animated canvas background -->
+  <canvas id="bg"></canvas>
+
+  <!-- ── Login ───────────────────────────────────────────────────────────── -->
+  <div id="screenLogin" class="screen hidden">
+    <div class="shell">
+      <div class="brand-row">
+        <div class="brand-mark">H</div>
+        <div class="brand-text">
+          <span class="brand-name">Haven</span>
+          <span class="brand-motto">keeping the source safe</span>
         </div>
-        <div class="auth-form">
-          <input id="loginEmail" class="auth-input" type="email" placeholder="Email" autocomplete="email" />
-          <input id="loginPassword" class="auth-input" type="password" placeholder="Password" autocomplete="current-password" />
-          <div id="loginError" class="auth-error hidden"></div>
-          <button id="loginBtn" class="auth-btn">Sign In</button>
-          <div class="auth-links">
-            <span class="auth-link" id="goForgot">Forgot password?</span>
-            <span class="auth-link" id="goSignup">Create account</span>
-          </div>
+      </div>
+      <div class="auth-box">
+        <input id="loginEmail"    class="field" type="email"    placeholder="Email" autocomplete="email" />
+        <input id="loginPassword" class="field" type="password" placeholder="Password" autocomplete="current-password" />
+        <div id="loginError" class="msg-error hidden"></div>
+        <button id="loginBtn" class="btn-primary">Sign In</button>
+        <div class="auth-links">
+          <span class="link" id="goForgot">Forgot password?</span>
+          <span class="link" id="goSignup">Create account</span>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- Sign Up -->
-    <div id="screenSignup" class="screen hidden">
-      <div class="card">
-        <div class="glow glow-1"></div><div class="glow glow-2"></div>
-        <div class="top">
-          <div class="logo-wrap">
-            <div class="logo">H</div>
-            <div><h1>Haven</h1><p class="subtitle">Create your account</p></div>
-          </div>
+  <!-- ── Sign Up ──────────────────────────────────────────────────────────── -->
+  <div id="screenSignup" class="screen hidden">
+    <div class="shell">
+      <div class="brand-row">
+        <div class="brand-mark">H</div>
+        <div class="brand-text">
+          <span class="brand-name">Haven</span>
+          <span class="brand-motto">keeping the source safe</span>
         </div>
-        <div class="auth-form">
-          <input id="signupEmail" class="auth-input" type="email" placeholder="Email" autocomplete="email" />
-          <input id="signupPassword" class="auth-input" type="password" placeholder="Password (min 6 chars)" autocomplete="new-password" />
-          <div id="signupError" class="auth-error hidden"></div>
-          <div id="signupSuccess" class="auth-success hidden"></div>
-          <button id="signupBtn" class="auth-btn">Create Account</button>
-          <div class="auth-links">
-            <span class="auth-link" id="goLogin">Back to sign in</span>
-          </div>
+      </div>
+      <div class="auth-box">
+        <input id="signupEmail"    class="field" type="email"    placeholder="Email" autocomplete="email" />
+        <input id="signupPassword" class="field" type="password" placeholder="Password (min 6 chars)" autocomplete="new-password" />
+        <div id="signupError"   class="msg-error hidden"></div>
+        <div id="signupSuccess" class="msg-ok hidden"></div>
+        <button id="signupBtn" class="btn-primary">Create Account</button>
+        <div class="auth-links">
+          <span class="link" id="goLogin">Back to sign in</span>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- Forgot Password -->
-    <div id="screenForgot" class="screen hidden">
-      <div class="card">
-        <div class="glow glow-1"></div><div class="glow glow-2"></div>
-        <div class="top">
-          <div class="logo-wrap">
-            <div class="logo">H</div>
-            <div><h1>Haven</h1><p class="subtitle">Reset your password</p></div>
-          </div>
+  <!-- ── Forgot ───────────────────────────────────────────────────────────── -->
+  <div id="screenForgot" class="screen hidden">
+    <div class="shell">
+      <div class="brand-row">
+        <div class="brand-mark">H</div>
+        <div class="brand-text">
+          <span class="brand-name">Haven</span>
+          <span class="brand-motto">keeping the source safe</span>
         </div>
-        <div class="auth-form">
-          <input id="forgotEmail" class="auth-input" type="email" placeholder="Your email address" />
-          <div id="forgotError" class="auth-error hidden"></div>
-          <div id="forgotSuccess" class="auth-success hidden"></div>
-          <button id="forgotBtn" class="auth-btn">Send Reset Email</button>
-          <div class="auth-links">
-            <span class="auth-link" id="goLoginFromForgot">Back to sign in</span>
-          </div>
+      </div>
+      <div class="auth-box">
+        <input id="forgotEmail" class="field" type="email" placeholder="Your email address" />
+        <div id="forgotError"   class="msg-error hidden"></div>
+        <div id="forgotSuccess" class="msg-ok hidden"></div>
+        <button id="forgotBtn" class="btn-primary">Send Reset Email</button>
+        <div class="auth-links">
+          <span class="link" id="goLoginFromForgot">Back to sign in</span>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- Main App -->
-    <div id="screenMain" class="screen hidden">
-      <div class="card">
-        <div class="glow glow-1"></div><div class="glow glow-2"></div>
-        <div class="top">
-          <div class="logo-wrap">
-            <div class="logo">H</div>
-            <div><h1>Haven</h1><p class="subtitle">Protecting your browsing</p></div>
-          </div>
-          <button id="signOutBtn" class="signout-btn">Sign Out</button>
-        </div>
+  <!-- ── Main App ─────────────────────────────────────────────────────────── -->
+  <div id="screenMain" class="screen hidden">
+    <div class="shell">
 
-        <div id="resultCard" class="result-card idle">
-          <div class="status-label" id="statusLabel">Status</div>
-          <div id="resultText" class="result-text">Not scanned yet</div>
-          <div id="resultSubtext" class="result-subtext">Click a lens below to begin.</div>
-        </div>
+      <!-- Top bar -->
+      <div class="top-bar">
+        <button class="haven-trigger" id="havenTrigger">
+          <div class="brand-mark">H</div>
+          <div class="brand-text">
+            <span class="brand-name">Haven</span>
+            <span class="brand-motto">keeping the source safe</span>
+          </div>
+          <svg class="chevron" id="chevron" viewBox="0 0 10 6" fill="none">
+            <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
 
-        <div class="lens-box">
-          <div class="lens-row clickable" id="lensText">
-            <div class="lens-info">
-              <span class="lens-name">Misinformation Lens</span>
-              <span class="lens-desc">Scan page text for false claims</span>
-            </div>
-            <span class="badge active">Active</span>
-          </div>
-          <div class="lens-row clickable" id="lensImage">
-            <div class="lens-info">
-              <span class="lens-name">AI Lens</span>
-              <span class="lens-desc">Click an image to analyse</span>
-            </div>
-            <span class="badge active">Active</span>
-          </div>
-          <div class="lens-row">
-            <div class="lens-info">
-              <span class="lens-name">Source Trace</span>
-              <span class="lens-desc">Verify article origins</span>
-            </div>
-            <span class="badge soon">Coming Soon</span>
-          </div>
+        <!-- Account dropdown -->
+        <div class="account-drop hidden" id="accountDrop">
+          <div class="drop-email" id="dropEmail"></div>
+          <button id="signOutBtn" class="drop-signout">Sign out</button>
         </div>
       </div>
-    </div>
 
-    <script src="auth.js"></script>
-    <script src="popup.js"></script>
-  </body>
+      <!-- Divider -->
+      <div class="divider"></div>
+
+      <!-- Result panel -->
+      <div id="resultCard" class="result-card idle">
+        <div class="result-label" id="statusLabel">READY</div>
+        <div class="result-title" id="resultText">Not scanned yet</div>
+        <div class="result-sub"   id="resultSubtext">Select a lens below to begin.</div>
+      </div>
+
+      <!-- Lens rows -->
+      <div class="lens-list">
+        <button class="lens-row" id="lensText">
+          <div class="lens-icon">
+            <svg viewBox="0 0 20 20" fill="none"><circle cx="9" cy="9" r="6" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 13.5L17 17" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          </div>
+          <div class="lens-info">
+            <span class="lens-name">Misinformation Lens</span>
+            <span class="lens-desc">Scan page text for false claims</span>
+          </div>
+          <div class="lens-badge active">Active</div>
+        </button>
+
+        <button class="lens-row" id="lensImage">
+          <div class="lens-icon">
+            <svg viewBox="0 0 20 20" fill="none"><rect x="2" y="4" width="16" height="12" rx="2" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="9" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M2 14l4-3 3 3 3-3 6 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="lens-info">
+            <span class="lens-name">AI Lens</span>
+            <span class="lens-desc">Click an image to analyse</span>
+          </div>
+          <div class="lens-badge active">Active</div>
+        </button>
+
+        <div class="lens-row disabled">
+          <div class="lens-icon muted">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M10 2L3 7v6l7 5 7-5V7L10 2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="lens-info">
+            <span class="lens-name muted">Source Trace</span>
+            <span class="lens-desc">Verify article origins</span>
+          </div>
+          <div class="lens-badge soon">Soon</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script src="auth.js"></script>
+  <script src="popup.js"></script>
+</body>
 </html>
